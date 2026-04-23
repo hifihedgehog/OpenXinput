@@ -1,3 +1,28 @@
+# OpenXInput (PadForge fork)
+
+Fork of [Nemirtingas/OpenXInput](https://github.com/Nemirtingas/OpenXInput) used by [PadForge](https://github.com/hifihedgehog/PadForge) to filter out HIDMaestro virtual controllers from PadForge's own in-process XInput view, without affecting other processes.
+
+## What changed from upstream
+
+One addition in [`src/OpenXinput.cpp`](src/OpenXinput.cpp):
+
+- `IsHidMaestroInterface(DevicePath)` — self-contained PnP walk (cfgmgr32 + devpkey, no external deps). Fast-path substring-matches the interface symlink for `HIDMAESTRO` / `HMCOMPANION`, then falls back to a depth-4 parent walk checking `DEVPKEY_Device_HardwareIds` for `HIDMAESTRO`.
+- One call site in `EnumerateXInputDevices`: right after `GetDeviceInterfaceDetail` returns a `DevicePath`, before `OpenDevice`. HM interfaces are skipped before registration, so they never occupy a user-index. Surviving non-HM interfaces pack `0..N-1` naturally via the existing enumeration logic.
+
+No other changes beyond upstream `OpenXinput1_4`.
+
+## Why
+
+HIDMaestro (PadForge's virtual-controller backend) spoofs real VID/PIDs by design, so VID/PID can't be used as a classifier. The PnP-ancestor walk for the literal string `HIDMaestro` is the structural signal that's independent of device identity spoofing.
+
+PadForge ships this DLL embedded in its single-file exe; at startup it calls `SetDllDirectory` on the single-file extraction directory so SDL3's `LoadLibrary("xinput1_4.dll")` picks up this fork instead of `System32\xinput1_4.dll`. Only PadForge's process is affected; every other XInput consumer on the system keeps seeing the virtuals.
+
+## Licensing
+
+Upstream ships only a Microsoft trademark disclaimer, not an OSS license. This fork inherits that state — it adds no new grant. Use at your own risk. See upstream's own disclaimer below.
+
+---
+
 # OpenXInput
 A re-implementation of the XInput userspace library for Windows that allows for use of more than 4 XInput devices, while maintaining compatibility with standard XInput.
 

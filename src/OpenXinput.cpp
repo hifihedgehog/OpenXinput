@@ -1,6 +1,91 @@
 #include "OpenXinputInternal.h"
 #include <usbspec.h>
 
+/* PadForge/HIDMaestro classifier: walks the PnP parent chain of an
+   XUSB device-interface path, looking for "HIDMaestro" in the Hardware
+   IDs of the interface's devnode or any of its ancestors.  Returns
+   true iff the interface is backed by a HIDMaestro virtual controller.
+   Self-contained on top of cfgmgr32.h + devpkey.h; no SDL or external
+   dependencies.  Used at enumeration time to skip HM interfaces before
+   registration, so they never occupy a user-index in OpenXInput's
+   internal device list. */
+#include <cfgmgr32.h>
+#include <initguid.h>
+#include <devpkey.h>
+#include <wctype.h>
+#pragma comment(lib, "cfgmgr32.lib")
+
+static bool IsHidMaestroInterface(LPCWSTR DevicePath)
+{
+    if (DevicePath == nullptr || DevicePath[0] == L'\0') return false;
+
+    /* Fast path: substring-match on the interface symlink itself.
+       Catches unspoofed HIDMaestro paths (literal "HIDMAESTRO" or
+       "HMCOMPANION") without any CM API calls. */
+    {
+        size_t n = wcslen(DevicePath);
+        for (size_t i = 0; i + 10 <= n; ++i) {
+            if ((DevicePath[i] == L'H' || DevicePath[i] == L'h') &&
+                _wcsnicmp(DevicePath + i, L"HIDMAESTRO", 10) == 0) return true;
+            if ((DevicePath[i] == L'H' || DevicePath[i] == L'h') &&
+                i + 11 <= n && _wcsnicmp(DevicePath + i, L"HMCOMPANION", 11) == 0) return true;
+        }
+    }
+
+    /* PnP walk.  Depth 3 covers HID child -> HIDClass parent -> ROOT
+       enumerator, which is where HIDMaestro's HMCOMPANION root node
+       sits for Xbox-family virtual profiles. */
+    /* PnP walk.  For HIDMaestro Xbox-family profiles, the HID child
+       spoofs the real gamepad's hardware IDs at depth 0; the HIDMaestro
+       marker appears at depth 1+ on the HMCOMPANION ancestor node. */
+    ULONG  size = 0;
+    DEVPROPTYPE type = 0;
+    WCHAR  instanceId[MAX_DEVICE_ID_LEN] = { 0 };
+    size = sizeof(instanceId);
+    if (CM_Get_Device_Interface_PropertyW(DevicePath, &DEVPKEY_Device_InstanceId,
+                                          &type, (PBYTE)instanceId, &size, 0) != CR_SUCCESS)
+        return false;
+
+    DEVINST devInst;
+    if (CM_Locate_DevNodeW(&devInst, instanceId, CM_LOCATE_DEVNODE_NORMAL) != CR_SUCCESS)
+        return false;
+
+    const int maxDepth = 4;
+    for (int depth = 0; depth < maxDepth; ++depth) {
+        ULONG hwSize = 0;
+        DEVPROPTYPE hwType = 0;
+        CM_Get_DevNode_PropertyW(devInst, &DEVPKEY_Device_HardwareIds,
+                                 &hwType, nullptr, &hwSize, 0);
+        if (hwSize > 0 && hwType == DEVPROP_TYPE_STRING_LIST) {
+            WCHAR *hw = (WCHAR *)malloc(hwSize);
+            if (hw != nullptr &&
+                CM_Get_DevNode_PropertyW(devInst, &DEVPKEY_Device_HardwareIds,
+                                         &hwType, (PBYTE)hw, &hwSize, 0) == CR_SUCCESS) {
+                size_t ccTotal = hwSize / sizeof(WCHAR);
+                size_t i = 0;
+                while (i < ccTotal && hw[i] != L'\0') {
+                    LPCWSTR id = &hw[i];
+                    size_t idLen = wcslen(id);
+                    for (size_t j = 0; j + 10 <= idLen; ++j) {
+                        if (_wcsnicmp(id + j, L"HIDMAESTRO", 10) == 0) {
+                            free(hw);
+                            return true;
+                        }
+                    }
+                    i += idLen + 1;
+                }
+            }
+            free(hw);
+        }
+
+        DEVINST parent = 0;
+        if (CM_Get_Parent(&parent, devInst, 0) != CR_SUCCESS) break;
+        devInst = parent;
+    }
+
+    return false;
+}
+
 #if(_WIN32_WINNT >= _WIN32_WINNT_WIN10)
 // XInputEnable is deprecated since Windows 10, disable the warning if needed to build Xinput.
 #pragma warning(disable : 4995)
@@ -1001,6 +1086,13 @@ HRESULT EnumerateXInputDevices()
 
         if (GetDeviceInterfaceDetail(hDeviceInfoList, &DevinfoData, &DevIfaceDetailData) >= 0)
         {
+            /* PadForge/HIDMaestro: skip interfaces backed by HIDMaestro
+               virtual controllers so they never get registered and never
+               occupy a user-index.  Surviving non-HM interfaces get
+               packed 0..N-1 naturally. */
+            if (IsHidMaestroInterface(DevIfaceDetailData->DevicePath))
+                continue;
+
             hDevice = Utilities::OpenDevice(DevIfaceDetailData->DevicePath, FILE_ATTRIBUTE_NORMAL);
             if (hDevice != INVALID_HANDLE_VALUE)
             {
