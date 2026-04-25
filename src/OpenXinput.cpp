@@ -20,24 +20,20 @@ static bool IsHidMaestroInterface(LPCWSTR DevicePath)
     if (DevicePath == nullptr || DevicePath[0] == L'\0') return false;
 
     /* Fast path: substring-match on the interface symlink itself.
-       Catches unspoofed HIDMaestro paths (literal "HIDMAESTRO" or
-       "HMCOMPANION") without any CM API calls. */
+       Catches unspoofed HIDMaestro paths (literal "HIDMAESTRO") without
+       any CM API calls. */
     {
         size_t n = wcslen(DevicePath);
         for (size_t i = 0; i + 10 <= n; ++i) {
             if ((DevicePath[i] == L'H' || DevicePath[i] == L'h') &&
                 _wcsnicmp(DevicePath + i, L"HIDMAESTRO", 10) == 0) return true;
-            if ((DevicePath[i] == L'H' || DevicePath[i] == L'h') &&
-                i + 11 <= n && _wcsnicmp(DevicePath + i, L"HMCOMPANION", 11) == 0) return true;
         }
     }
 
-    /* PnP walk.  Depth 3 covers HID child -> HIDClass parent -> ROOT
-       enumerator, which is where HIDMaestro's HMCOMPANION root node
-       sits for Xbox-family virtual profiles. */
     /* PnP walk.  For HIDMaestro Xbox-family profiles, the HID child
        spoofs the real gamepad's hardware IDs at depth 0; the HIDMaestro
-       marker appears at depth 1+ on the HMCOMPANION ancestor node. */
+       marker appears on a depth 1+ ancestor.  Depth 4 covers it with
+       margin. */
     ULONG  size = 0;
     DEVPROPTYPE type = 0;
     WCHAR  instanceId[MAX_DEVICE_ID_LEN] = { 0 };
