@@ -9,7 +9,7 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 option(OPENXINPUT_STATIC_GUIDS     "Static GUIDs instead. (Uses less dependencies)" ON)
 option(OPENXINPUT_DISABLE_COM      "Disable COM calls." ON)
 
-set(OPENXINPUT_XUSER_MAX_COUNT 8 CACHE STRING "Max controller count supported by OpenXinput. (Can't be less than 4 because of Xinput compatibility)")
+set(OPENXINPUT_XUSER_MAX_COUNT 16 CACHE STRING "Max controller count supported by OpenXinput. (Can't be less than 4 because of Xinput compatibility)")
 
 option(OPENXINPUT_BUILD_EXAMPLE    "Build OpenXinput example." OFF)
 
