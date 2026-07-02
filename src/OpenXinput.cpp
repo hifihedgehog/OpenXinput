@@ -2698,10 +2698,11 @@ HRESULT PowerOffController(DeviceInfo_t* pDevice)
 {
     InBaseRequest_t inBuff;
 
-    if (pDevice->XUSBVersion < XUSB_VERSION_1_2)
-        return E_FAIL;
-
-    inBuff.XUSBVersion = XUSB_VERSION_1_2;
+    // PadForge: HID-backed pads (Bluetooth Series/One via xinputhid.sys)
+    // report XUSB_VERSION_1_1, and the upstream gate refused to send the
+    // power-down for them without ever asking the driver. Send the device's
+    // own version instead and let the driver accept or reject the request.
+    inBuff.XUSBVersion = pDevice->XUSBVersion >= XUSB_VERSION_1_2 ? XUSB_VERSION_1_2 : pDevice->XUSBVersion;
     inBuff.DeviceIndex = pDevice->dwUserIndex;
     return SendIoctl(pDevice->hDevice, Protocol::IOCTL_XINPUT_POWER_DOWN_DEVICE, &inBuff, sizeof(InBaseRequest_t));
 }
