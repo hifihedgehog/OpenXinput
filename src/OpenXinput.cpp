@@ -849,6 +849,16 @@ public:
                 return false;
         }
 
+        // PadForge: never let a HIDMaestro virtual interface answer a
+        // quick-path query (battery / audio device id). The main enumeration
+        // filters HM interfaces before registration, but these fast paths
+        // enumerate the interface class raw and take the first answer, so an
+        // HM companion could answer a physical pad's battery query with its
+        // constant placeholder bytes. Returning true with an invalid handle
+        // skips this interface and keeps the caller's loop running.
+        if (IsHidMaestroInterface(DeviceInterfaceDetailData->DevicePath))
+            return true;
+
         *phDevice = Utilities::OpenDevice(DeviceInterfaceDetailData->DevicePath, FILE_ATTRIBUTE_NORMAL);
         return true;
     }
@@ -2613,21 +2623,26 @@ HRESULT GetBatteryInformation(DeviceInfo_t* pDevice, BYTE DeviceType, XINPUT_BAT
     UINT RenderCount;
     int v7;
 
-    if (pDevice->XUSBVersion >= XUSB_VERSION_1_2)
-    {
-        InBuffer.XUSBVersion = XUSB_VERSION_1_2;
-        InBuffer.DeviceIndex = pDevice->dwUserIndex;
-        InBuffer.DeviceType = DeviceType;
-        
-        ZeroMemory(&OutBuffer, sizeof(GamepadBatteryInformation0102));
+    // PadForge: mirror the PowerOffController fix below. HID-backed pads
+    // (Bluetooth Series/One via xinputhid.sys) report XUSB_VERSION_1_1, and
+    // upstream never asked the driver for their battery: it fabricated
+    // WIRED/FULL, then downgraded to DISCONNECTED because the (USB-only)
+    // audio-endpoint probe finds nothing on a Bluetooth pad, so Bluetooth
+    // Xbox pads always read as batteryless. Send the IOCTL with the device's
+    // own version and let the driver accept or reject. The fabricated answer
+    // survives only as the sub-1.2 fallback for drivers that refuse.
+    InBuffer.XUSBVersion = pDevice->XUSBVersion >= XUSB_VERSION_1_2 ? XUSB_VERSION_1_2 : pDevice->XUSBVersion;
+    InBuffer.DeviceIndex = pDevice->dwUserIndex;
+    InBuffer.DeviceType = DeviceType;
 
-        hr = SendReceiveIoctl(pDevice->hDevice, Protocol::IOCTL_XINPUT_GET_BATTERY_INFORMATION, &InBuffer, sizeof(InGamepadBatteryInformation0102), &OutBuffer, sizeof(GamepadBatteryInformation0102), nullptr);
-        if (hr >= 0)
-        {
-            hr = Utilities::SafeCopyToUntrustedBuffer(pBatteryInformation, &OutBuffer.BatteryType, sizeof(XINPUT_BATTERY_INFORMATION));
-        }
+    ZeroMemory(&OutBuffer, sizeof(GamepadBatteryInformation0102));
+
+    hr = SendReceiveIoctl(pDevice->hDevice, Protocol::IOCTL_XINPUT_GET_BATTERY_INFORMATION, &InBuffer, sizeof(InGamepadBatteryInformation0102), &OutBuffer, sizeof(GamepadBatteryInformation0102), nullptr);
+    if (hr >= 0)
+    {
+        hr = Utilities::SafeCopyToUntrustedBuffer(pBatteryInformation, &OutBuffer.BatteryType, sizeof(XINPUT_BATTERY_INFORMATION));
     }
-    else
+    else if (pDevice->XUSBVersion < XUSB_VERSION_1_2)
     {
         BatteryInformation.BatteryType = BATTERY_TYPE_WIRED;
         BatteryInformation.BatteryLevel = BATTERY_LEVEL_FULL;
@@ -3771,7 +3786,10 @@ DWORD WINAPI OpenXInputGetBatteryInformation(_In_ DWORD dwUserIndex, _In_ BYTE d
                 run = quickEnum.GetNext(&hDevice);
                 if (hDevice != INVALID_HANDLE_VALUE)
                 {
-                    if (XInputInternal::DeviceInfo::MinFillFromInterface(hDevice, &device) && device.XUSBVersion >= XUSB_VERSION_1_2)
+                    // PadForge: no version gate here. DriverComm::GetBatteryInformation
+                    // now sends the IOCTL with the device's own version (sub-1.2
+                    // Bluetooth pads included) and falls back internally.
+                    if (XInputInternal::DeviceInfo::MinFillFromInterface(hDevice, &device))
                     {
                         device.dwUserIndex = (BYTE)dwUserIndex;
                         if (DriverComm::GetBatteryInformation(&device, XINPUT_DEVTYPE_GAMEPAD, pBatteryInformation) >= 0)
