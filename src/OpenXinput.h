@@ -457,6 +457,36 @@ typedef DWORD(WINAPI OpenXInputGetMaxControllerCount_t)();
 typedef DWORD(WINAPI OpenXInputGetDeviceUSBIds_t)(DWORD, WORD*, WORD*, WORD*);
 typedef DWORD(WINAPI OpenXInputGetStateFull_t)(DWORD, OPENXINPUT_STATE_FULL*);
 
+// Cached identity of the object serving a public XInput slot. The channel index
+// belongs to the interface and is not the public slot number. All API calls must
+// finish before releasing the library, as with the other OpenXInput functions.
+typedef struct _OPENXINPUT_DEVICE_IDENTITY_V1
+{
+    DWORD cbSize;
+    DWORD requiredCch; // Path size including its terminating WCHAR.
+    ULONGLONG generation; // Nonzero for the lifetime of this slot attachment.
+    DWORD interfaceIndex;
+    DWORD interfaceCount; // Channel count reported when the interface was opened.
+} OPENXINPUT_DEVICE_IDENTITY_V1;
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// No enumeration or device I/O. ERROR_BUSY is retryable. A null path with zero
+// capacity queries its required size and returns ERROR_INSUFFICIENT_BUFFER.
+// Other failures clear the outputs after validating cbSize and the arguments.
+DWORD WINAPI OpenXInputGetDeviceIdentityV1(
+    DWORD dwUserIndex, OPENXINPUT_DEVICE_IDENTITY_V1* identity,
+    WCHAR* path, DWORD capacityCch);
+
+#ifdef __cplusplus
+}
+#endif
+
+typedef DWORD(WINAPI OpenXInputGetDeviceIdentityV1_t)(
+    DWORD, OPENXINPUT_DEVICE_IDENTITY_V1*, WCHAR*, DWORD);
+
 
 #ifdef __cplusplus
 extern "C" {

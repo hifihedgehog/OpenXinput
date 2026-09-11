@@ -19,3 +19,4 @@ XInputGetSystemButtons          @109 NONAME
 OpenXInputGetMaxControllerCount @999
 OpenXInputGetDeviceUSBIds       @1000
 OpenXInputGetStateFull          @1001
+OpenXInputGetDeviceIdentityV1    @1002

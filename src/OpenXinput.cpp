@@ -130,6 +130,9 @@ struct DeviceInfo_t {
     WORD RightStickVirtualKey;
     WORD field_4C;
     WORD field_4E;
+    DWORD identityPathCapacity;
+    DWORD interfaceCount;
+    ULONGLONG identityGeneration;
 };
 
 struct XINPUT_AUDIO_INFORMATION
@@ -432,6 +435,8 @@ static DWORD g_dwSettings = SET_USER_LED_ON_CREATE | DISABLE_USER_LED_ON_DESTROY
 static DWORD g_dwDeviceListSize = 0;
 static DeviceInfo_t** g_pDeviceList;
 static DeviceInfo_t** g_pBusDeviceList;
+// Protected by g_csGlobalLock. Retained across library reinitialization.
+static ULONGLONG g_identityGeneration;
 
 static DWORD g_dwLogVerbosity = 0;
 
@@ -1173,6 +1178,7 @@ HRESULT EnumerateDevicesOnDeviceInterface(HANDLE hDevice, LPCWSTR DevicePath)
         }
 
         pDevice->dwUserIndex = i;
+        pDevice->interfaceCount = deviceInfos.deviceIndex;
         pDevice->productId = deviceInfos.productId;
         pDevice->vendorId = deviceInfos.vendorId;
         pDevice->XUSBVersion = deviceInfos.XUSBVersion;
@@ -1752,6 +1758,7 @@ DeviceInfo_t* Create(HANDLE hDevice, LPCWSTR lpDevicePath)
         if (DuplicateHandle(hSourceProcessHandle, hDevice, hSourceProcessHandle, &pDevice->hDevice, 0, FALSE, DUPLICATE_SAME_ACCESS))
         {
             pDevice->dwDevicePathSize = wcslen(lpDevicePath) + 1;
+            pDevice->identityPathCapacity = pDevice->dwDevicePathSize;
             pDevice->lpDevicePath = (LPWSTR)Utilities::MemAlloc((pDevice->dwDevicePathSize + 1) * sizeof(WCHAR));
             if (pDevice->lpDevicePath)
             {
@@ -1799,10 +1806,12 @@ void Recycle(DeviceInfo_t* pDevice)
 
     HANDLE hDevice = pDevice->hDevice;
     LPWSTR lpDevicePath = pDevice->lpDevicePath;
+    DWORD identityPathCapacity = pDevice->identityPathCapacity;
     memset(pDevice, 0, sizeof(DeviceInfo_t));
     pDevice->hDevice = hDevice;
     pDevice->hGuideWait = INVALID_HANDLE_VALUE;
     pDevice->lpDevicePath = lpDevicePath;
+    pDevice->identityPathCapacity = identityPathCapacity;
     pDevice->dwBusIndex = 255;
 }
 
@@ -2182,6 +2191,11 @@ HRESULT SetDeviceOnPort(DWORD dwUserIndex, DeviceInfo_t* pDevice)
     if (pDevice && g_pDeviceList[dwUserIndex] )
         return E_FAIL;
 
+    if (pDevice) {
+        // Exhaustion disables identity queries instead of reusing an old token.
+        pDevice->identityGeneration = (g_identityGeneration != MAXULONGLONG)
+            ? ++g_identityGeneration : 0;
+    }
     g_pDeviceList[dwUserIndex] = pDevice;
     return S_OK;
 }
@@ -2224,6 +2238,7 @@ void RemoveBusDevice(DWORD dwBusIndex)
             if (pDevice != nullptr && pDevice->dwBusIndex == dwBusIndex)
             {
                 pDevice->status &= ~DEVICE_STATUS_ACTIVE;
+                pDevice->identityGeneration = 0;
                 pDevice->dwBusIndex = 255;
             }
         }
@@ -3622,8 +3637,11 @@ DWORD WINAPI OpenXInputGetState(_In_ DWORD dwUserIndex, _Out_ XINPUT_STATE* pSta
     {
         DeviceInfo_t* pDevice;
 
-        if (DeviceEnum::GetDeviceOnPort(dwUserIndex, &pDevice, 0) >= 0 && pDevice != nullptr)
-            EventWriteVidPid(pDevice->vendorId, pDevice->productId);
+        if (XInputCore::Enter() >= 0) {
+            if (DeviceEnum::GetDeviceOnPort(dwUserIndex, &pDevice, 0) >= 0 && pDevice != nullptr)
+                EventWriteVidPid(pDevice->vendorId, pDevice->productId);
+            XInputCore::Leave();
+        }
 
         pState->Gamepad.wButtons &= XINPUT_BUTTON_MASK_WITHOUT_GUIDE;
     }
@@ -3676,7 +3694,10 @@ DWORD WINAPI OpenXInputGetCapabilities(_In_ DWORD dwUserIndex, _In_ DWORD dwFlag
 
 void WINAPI OpenXInputEnable(_In_ BOOL enable)
 {
-    XInputCore::EnableCommunications(enable != FALSE);
+    if (XInputCore::Enter() >= 0) {
+        XInputCore::EnableCommunications(enable != FALSE);
+        XInputCore::Leave();
+    }
 }
 
 DWORD WINAPI OpenXInputGetAudioDeviceIds(_In_ DWORD dwUserIndex, _Out_writes_opt_(*pRenderCount) LPWSTR pRenderDeviceId, _Inout_opt_ UINT* pRenderCount, _Out_writes_opt_(*pCaptureCount) LPWSTR pCaptureDeviceId, _Inout_opt_ UINT* pCaptureCount)
@@ -4021,6 +4042,65 @@ DWORD WINAPI OpenXInputGetDeviceUSBIds(DWORD dwUserIndex, WORD* pVendorId, WORD*
     hr = XInputCore::ProcessAPIRequest(dwUserIndex, XInputInternal::DeviceInfo::GetDeviceUSBIds, &apiParam, 1, FALSE);
     result = XInputReturnCodeFromHRESULT(hr);
 
+    return result;
+}
+
+DWORD WINAPI OpenXInputGetDeviceIdentityV1(DWORD dwUserIndex,
+    OPENXINPUT_DEVICE_IDENTITY_V1* identity, WCHAR* path, DWORD capacityCch)
+{
+    static_assert(sizeof(OPENXINPUT_DEVICE_IDENTITY_V1) == 24, "Identity ABI size");
+    static_assert(offsetof(OPENXINPUT_DEVICE_IDENTITY_V1, generation) == 8, "Identity ABI alignment");
+
+    if (!identity || identity->cbSize != sizeof(*identity) ||
+        dwUserIndex >= XUSER_MAX_COUNT || capacityCch > 32768 || (!path && capacityCch)) {
+        return ERROR_INVALID_PARAMETER;
+    }
+    identity->requiredCch = 0;
+    identity->generation = 0;
+    identity->interfaceIndex = 0;
+    identity->interfaceCount = 0;
+    if (path && capacityCch) {
+        path[0] = L'\0';
+    }
+    if (!g_IsInitialized) {
+        return ERROR_NOT_READY;
+    }
+    if (!TryEnterCriticalSection(&g_csGlobalLock)) {
+        return ERROR_BUSY;
+    }
+
+    DWORD result = ERROR_DEVICE_NOT_CONNECTED;
+    const DeviceInfo_t* device = dwUserIndex < g_dwDeviceListSize
+        ? g_pDeviceList[dwUserIndex] : nullptr;
+    if (XInputCore::g_pfnXInputGetState_Override) {
+        result = ERROR_NOT_SUPPORTED;
+    } else if (device && (device->status & DEVICE_STATUS_ACTIVE) &&
+               device->hDevice && device->hDevice != INVALID_HANDLE_VALUE) {
+        if (!device->identityGeneration) {
+            result = ERROR_NOT_SUPPORTED;
+        } else if (!device->lpDevicePath || !device->identityPathCapacity ||
+                   device->identityPathCapacity > 32768 || !device->interfaceCount ||
+                   device->dwUserIndex >= device->interfaceCount) {
+            result = ERROR_INVALID_DATA;
+        } else {
+            const size_t length = wcsnlen(device->lpDevicePath, device->identityPathCapacity);
+            if (!length || length == device->identityPathCapacity) {
+                result = ERROR_INVALID_DATA;
+            } else {
+                identity->requiredCch = static_cast<DWORD>(length + 1);
+                if (capacityCch < identity->requiredCch) {
+                    result = ERROR_INSUFFICIENT_BUFFER;
+                } else {
+                    CopyMemory(path, device->lpDevicePath, identity->requiredCch * sizeof(WCHAR));
+                    identity->generation = device->identityGeneration;
+                    identity->interfaceIndex = device->dwUserIndex;
+                    identity->interfaceCount = device->interfaceCount;
+                    result = ERROR_SUCCESS;
+                }
+            }
+        }
+    }
+    LeaveCriticalSection(&g_csGlobalLock);
     return result;
 }
 
