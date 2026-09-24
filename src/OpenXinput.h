@@ -487,6 +487,34 @@ DWORD WINAPI OpenXInputGetDeviceIdentityV1(
 typedef DWORD(WINAPI OpenXInputGetDeviceIdentityV1_t)(
     DWORD, OPENXINPUT_DEVICE_IDENTITY_V1*, WCHAR*, DWORD);
 
+// The state with the six XUSB report bytes that follow sThumbRY, which
+// XINPUT_STATE leaves out. Instruments outside the XInput subtypes carry data
+// there, such as the Rock Band 3 Pro keyboard's touch strip and pedal port.
+// extraByteCount is 6 when the driver answers with XUSB 1.1 or later, and 0
+// with XUSB 1.0, while input is disabled, or when another XInput serves the
+// call. extraBytes is zero whenever the count is 0.
+typedef struct _OPENXINPUT_STATE_EXTENDED_V1
+{
+    DWORD cbSize;         // sizeof(OPENXINPUT_STATE_EXTENDED_V1)
+    XINPUT_STATE state;   // As XInputGetStateEx returns it, guide button included
+    DWORD extraByteCount;
+    BYTE extraBytes[6];   // In report order
+} OPENXINPUT_STATE_EXTENDED_V1;
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// Returns what XInputGetStateEx returns, and ERROR_INVALID_PARAMETER for a
+// null pointer or a cbSize other than sizeof(OPENXINPUT_STATE_EXTENDED_V1).
+DWORD WINAPI OpenXInputGetStateExtendedV1(DWORD dwUserIndex, OPENXINPUT_STATE_EXTENDED_V1* pState);
+
+#ifdef __cplusplus
+}
+#endif
+
+typedef DWORD(WINAPI OpenXInputGetStateExtendedV1_t)(DWORD, OPENXINPUT_STATE_EXTENDED_V1*);
+
 
 #ifdef __cplusplus
 extern "C" {

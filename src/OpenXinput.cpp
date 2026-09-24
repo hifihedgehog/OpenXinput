@@ -133,6 +133,8 @@ struct DeviceInfo_t {
     DWORD identityPathCapacity;
     DWORD interfaceCount;
     ULONGLONG identityGeneration;
+    BYTE extraBytes[6];     // The XUSB 1.1 report bytes after sThumbRY
+    DWORD extraByteCount;   // 6 after an XUSB 1.1 reply, 0 after XUSB 1.0
 };
 
 struct XINPUT_AUDIO_INFORMATION
@@ -398,6 +400,11 @@ struct GetSystemButtonsApiParam_t
     XINPUT_SYSTEM_BUTTONS* pSystemButtons;
 };
 
+struct GetStateExtendedApiParam_t
+{
+    OPENXINPUT_STATE_EXTENDED_V1* pState;
+};
+
 struct GetDeviceUSBIdsApiParam_t
 {
     WORD* pVendorId;
@@ -618,6 +625,7 @@ HRESULT GetDeviceUSBIds(DeviceInfo_t* pDevice, void* pParams, DWORD reserved);
 static HRESULT(*g_pfnGetStateDispatcher)(DeviceInfo_t* pDevice, void* pParams, DWORD reserved);
 static HRESULT(*g_pfnSetVibrationDispatcher)(DeviceInfo_t* pDevice, void* pParams, DWORD reserved);
 static HRESULT(*g_pfnGetSystemButtonsDispatcher)(DeviceInfo_t* pDevice, void* pParams, DWORD reserved);
+static HRESULT(*g_pfnGetStateExtendedDispatcher)(DeviceInfo_t* pDevice, void* pParams, DWORD reserved);
 
 }
 }
@@ -934,6 +942,9 @@ HRESULT GrowList(DWORD newSize)
 
 void CopyGamepadStateToDeviceInfo(DeviceInfo_t* pDevice, GamepadState0100 *pGamepadState)
 {
+    ZeroMemory(pDevice->extraBytes, sizeof(pDevice->extraBytes));
+    pDevice->extraByteCount = 0;
+
     pDevice->DeviceState.dwPacketNumber = pGamepadState->dwPacketNumber;
     pDevice->DeviceState.Gamepad.bLeftTrigger = pGamepadState->bLeftTrigger;
     pDevice->DeviceState.Gamepad.bRightTrigger = pGamepadState->bRightTrigger;
@@ -965,6 +976,14 @@ void CopyGamepadStateToDeviceInfo(DeviceInfo_t* pDevice, GamepadState0101* pGame
 
     pDevice->SystemButtons.StandardSystemButtons = pGamepadState->wButtons & XINPUT_GAMEPAD_GUIDE;
     pDevice->SystemButtons.ExtraSystemButtons = pGamepadState->bExtraButtons & XINPUT_GAMEPAD_EXTRAS_SHARE;
+
+    pDevice->extraBytes[0] = pGamepadState->unk6;
+    pDevice->extraBytes[1] = pGamepadState->unk7;
+    pDevice->extraBytes[2] = pGamepadState->unk8;
+    pDevice->extraBytes[3] = pGamepadState->unk9;
+    pDevice->extraBytes[4] = pGamepadState->unk10;
+    pDevice->extraBytes[5] = pGamepadState->bExtraButtons;
+    pDevice->extraByteCount = sizeof(pDevice->extraBytes);
 
     if (pGamepadState->status == 1)
         pDevice->status |= DEVICE_STATUS_ACTIVE;
@@ -1693,6 +1712,26 @@ HRESULT GetSystemButtons(DeviceInfo_t* pDevice, void* pParams, DWORD reserved)
     return Utilities::SafeCopyToUntrustedBuffer(pApiParam->pSystemButtons, &pDevice->SystemButtons, sizeof(XINPUT_SYSTEM_BUTTONS));
 }
 
+HRESULT GetStateExtended(DeviceInfo_t* pDevice, void* pParams, DWORD reserved)
+{
+    HRESULT hr;
+    GetStateExtendedApiParam_t* pApiParam = (GetStateExtendedApiParam_t*)pParams;
+    OPENXINPUT_STATE_EXTENDED_V1 state;
+
+    if (IsDeviceInactive(pDevice))
+        return E_FAIL;
+
+    if ((hr = DriverComm::GetLatestDeviceInfo(pDevice)) < 0)
+        return hr;
+
+    // The state and the bytes come from the same reply
+    state.cbSize = sizeof(state);
+    state.state = pDevice->DeviceState;
+    state.extraByteCount = pDevice->extraByteCount;
+    CopyMemory(state.extraBytes, pDevice->extraBytes, sizeof(state.extraBytes));
+    return Utilities::SafeCopyToUntrustedBuffer(pApiParam->pState, &state, sizeof(state));
+}
+
 }
 
 namespace Disabled {
@@ -1727,6 +1766,20 @@ HRESULT SetVibration(DeviceInfo_t* pDevice, void* pParams, DWORD reserved)
     tmpDevice.DeviceVibration.wLeftMotorSpeed = 0;
     tmpDevice.DeviceVibration.wRightMotorSpeed = 0;
     return DriverComm::SendDeviceVibration(&tmpDevice);
+}
+
+HRESULT GetStateExtended(DeviceInfo_t* pDevice, void* pParams, DWORD reserved)
+{
+    GetStateExtendedApiParam_t* pApiParam = (GetStateExtendedApiParam_t*)pParams;
+    OPENXINPUT_STATE_EXTENDED_V1 state = {};
+
+    if (IsDeviceInactive(pDevice))
+        return E_FAIL;
+
+    // As Disabled::GetState: a neutral state whose packet number moves
+    state.cbSize = sizeof(state);
+    state.state.dwPacketNumber = pDevice->DeviceState.dwPacketNumber + 1;
+    return Utilities::SafeCopyToUntrustedBuffer(pApiParam->pState, &state, sizeof(state));
 }
 
 HRESULT GetSystemButtons(DeviceInfo_t* pDevice, void* pParams, DWORD reserved)
@@ -1832,12 +1885,14 @@ void OnEnableSettingChanged(BOOL bEnabled)
         g_pfnGetStateDispatcher = Enabled::GetState;
         g_pfnSetVibrationDispatcher = Enabled::SetVibration;
         g_pfnGetSystemButtonsDispatcher = Enabled::GetSystemButtons;
+        g_pfnGetStateExtendedDispatcher = Enabled::GetStateExtended;
     }
     else
     {
         g_pfnGetStateDispatcher = Disabled::GetState;
         g_pfnSetVibrationDispatcher = Disabled::SetVibration;
         g_pfnGetSystemButtonsDispatcher = Disabled::GetSystemButtons;
+        g_pfnGetStateExtendedDispatcher = Disabled::GetStateExtended;
     }
 }
 
@@ -4101,6 +4156,38 @@ DWORD WINAPI OpenXInputGetDeviceIdentityV1(DWORD dwUserIndex,
         }
     }
     LeaveCriticalSection(&g_csGlobalLock);
+    return result;
+}
+
+DWORD WINAPI OpenXInputGetStateExtendedV1(DWORD dwUserIndex, OPENXINPUT_STATE_EXTENDED_V1* pState)
+{
+    static_assert(sizeof(OPENXINPUT_STATE_EXTENDED_V1) == 32, "Extended state ABI size");
+    static_assert(offsetof(OPENXINPUT_STATE_EXTENDED_V1, extraBytes) == 24, "Extended state ABI layout");
+
+    GetStateExtendedApiParam_t apiParam;
+    DWORD result;
+    HRESULT hr;
+
+    if (pState == nullptr || pState->cbSize != sizeof(*pState))
+        return ERROR_INVALID_PARAMETER;
+
+    if (dwUserIndex >= XUSER_MAX_COUNT)
+        return ERROR_BAD_ARGUMENTS;
+
+    if (XInputCore::g_pfnXInputGetState_Override)
+    {
+        // Another XInput serves the call and knows no trailing bytes
+        pState->extraByteCount = 0;
+        ZeroMemory(pState->extraBytes, sizeof(pState->extraBytes));
+        result = XInputCore::g_pfnXInputGetState_Override(dwUserIndex, &pState->state);
+    }
+    else
+    {
+        apiParam.pState = pState;
+
+        hr = XInputCore::ProcessAPIRequest(dwUserIndex, XInputInternal::DeviceInfo::g_pfnGetStateExtendedDispatcher, &apiParam, 1, FALSE);
+        result = XInputReturnCodeFromHRESULT(hr);
+    }
     return result;
 }
 
